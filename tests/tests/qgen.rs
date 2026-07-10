@@ -35,6 +35,30 @@ use rstest::*;
 use serde_json::Value;
 use sqlx::{PgConnection, Row};
 
+/// Proptest configuration shared by every generator test in this file.
+///
+/// In the Antithesis proptests build — the `dst` feature, enabled by
+/// `docker/Dockerfile.proptests` — proptest draws its randomness from the Antithesis SDK via
+/// `RngAlgorithm::Antithesis`, so the platform controls and branches the entropy stream and its
+/// coverage-guided search can steer query generation. Under a normal `cargo test` the feature is
+/// off and this is just `Config::default()` (ChaCha RNG), preserving the previous behavior.
+fn qgen_proptest_config() -> proptest::test_runner::Config {
+    #[allow(unused_mut)]
+    let mut config = proptest::test_runner::Config::default();
+    #[cfg(feature = "dst")]
+    {
+        config.rng_algorithm = proptest::test_runner::RngAlgorithm::Antithesis;
+        // Disable proptest shrinking under Antithesis. Shrinking re-runs "simpler" inputs and
+        // expects the failure to reproduce, but here the Antithesis platform — not proptest —
+        // controls both the entropy stream and the fault schedule, so a replay sees a different
+        // history and the minimized input is meaningless (and wastes ~4x the cases chasing a
+        // failure it can't deterministically reproduce). With this at 0 proptest reports the
+        // original failing input as-is. See qgen-resilience-plan.md, Mod 2.
+        config.max_shrink_iters = 0;
+    }
+    config
+}
+
 const COLUMNS: &[Column] = &[
     Column::new("id", "SERIAL8", "'4'")
         .primary_key()
@@ -216,7 +240,7 @@ async fn generated_joins_small(database: Db) {
         .collect::<Vec<_>>();
     let setup_sql = generated_queries_setup(&mut pool.pull(), &tables_and_sizes, COLUMNS);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         (join, where_expr) in arb_joins_and_wheres(
             any::<JoinType>(),
             tables,
@@ -268,7 +292,7 @@ async fn generated_joins_large_limit(database: Db) {
         .collect::<Vec<_>>();
     let setup_sql = generated_queries_setup(&mut pool.pull(), &tables_and_sizes, COLUMNS);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         (join, where_expr) in arb_joins_and_wheres(
             Just(JoinType::Inner),
             tables,
@@ -317,7 +341,7 @@ async fn generated_single_relation(database: Db) {
     let table_name = "users";
     let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 10)], COLUMNS);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         where_expr in arb_wheres(
             vec![table_name],
             COLUMNS,
@@ -370,7 +394,7 @@ async fn generated_group_by_aggregates(database: Db) {
 
     let grouping_columns: Vec<_> = columns.iter().map(|col| col.name).collect();
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         text_where_expr in arb_wheres(
             vec![table_name],
             &columns,
@@ -484,7 +508,7 @@ async fn generated_paging_small(database: Db) {
     let table_name = "users";
     let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 1000)], COLUMNS);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         where_expr in arb_wheres(vec![table_name], &columns_named(vec!["name"])),
         paging_exprs in arb_paging_exprs(table_name, vec!["name", "color", "age", "quantity"], vec!["id", "uuid"]),
         gucs in any::<PgGucs>(),
@@ -522,7 +546,7 @@ async fn generated_paging_large(database: Db) {
     let table_name = "users";
     let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 100000)], COLUMNS);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         paging_exprs in arb_paging_exprs(table_name, vec![], vec!["uuid"]),
         gucs in any::<PgGucs>(),
     )| {
@@ -559,7 +583,7 @@ async fn generated_subquery(database: Db) {
         COLUMNS,
     );
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         outer_where_expr in arb_wheres(
             vec![outer_table_name],
             COLUMNS,
@@ -656,7 +680,7 @@ async fn generated_joinscan(database: Db) {
     // NumericBytes fast field projection is tested separately in fast_fields.rs.
     let numeric_columns = ["age"];
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         num_tables in 2..=3usize,
         // Outer table BM25 predicate (always present)
         outer_bm25 in arb_wheres(vec![all_tables[0]], &text_columns),
@@ -692,7 +716,7 @@ async fn generated_joinscan(database: Db) {
         let join_expr = {
             use proptest::strategy::ValueTree;
             use proptest::test_runner::TestRunner;
-            let mut runner = TestRunner::default();
+            let mut runner = TestRunner::new(qgen_proptest_config());
             join.new_tree(&mut runner).unwrap().current()
         };
 
@@ -864,7 +888,7 @@ async fn generated_aggregate_join(database: Db) {
         format!("{}.metadata->'brand'", all_tables[0]),
     ]);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         num_tables in 2..=3usize,
         // Outer table BM25 predicate
         outer_bm25 in arb_wheres(vec![all_tables[0]], &text_columns),
@@ -894,7 +918,7 @@ async fn generated_aggregate_join(database: Db) {
         let join_expr = {
             use proptest::strategy::ValueTree;
             use proptest::test_runner::TestRunner;
-            let mut runner = TestRunner::default();
+            let mut runner = TestRunner::new(qgen_proptest_config());
             join.new_tree(&mut runner).unwrap().current()
         };
 
@@ -984,7 +1008,7 @@ async fn generated_aggregate_join_distinct(database: Db) {
         .map(|col| col.name)
         .collect();
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         num_tables in 2..=3usize,
         outer_bm25 in arb_wheres(vec![all_tables[0]], &text_columns),
         group_by_expr in arb_group_by(
@@ -1008,7 +1032,7 @@ async fn generated_aggregate_join_distinct(database: Db) {
         let join_expr = {
             use proptest::strategy::ValueTree;
             use proptest::test_runner::TestRunner;
-            let mut runner = TestRunner::default();
+            let mut runner = TestRunner::new(qgen_proptest_config());
             join.new_tree(&mut runner).unwrap().current()
         };
 
@@ -1103,7 +1127,7 @@ async fn generated_group_by_stddev(database: Db) {
 
     let grouping_columns: Vec<_> = columns.iter().map(|col| col.name).collect();
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         text_where_expr in arb_wheres(
             vec![table_name],
             &columns,
@@ -1220,7 +1244,7 @@ async fn generated_join_aggregates(database: Db) {
         .map(|col| format!("{}.{}", all_tables[0], col.name))
         .collect();
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         // Outer table BM25 predicate
         outer_bm25 in arb_wheres(vec![all_tables[0]], &text_columns),
         // GROUP BY + aggregates
@@ -1240,7 +1264,7 @@ async fn generated_join_aggregates(database: Db) {
         let join_expr = {
             use proptest::strategy::ValueTree;
             use proptest::test_runner::TestRunner;
-            let mut runner = TestRunner::default();
+            let mut runner = TestRunner::new(qgen_proptest_config());
             join.new_tree(&mut runner).unwrap().current()
         };
 
@@ -1341,7 +1365,7 @@ async fn generated_numeric_pushdown(database: Db) {
         "age",           // INTEGER - for comparison
     ]);
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         numeric_expr in arb_numeric_expr(vec![table_name], &numeric_columns),
         gucs in any::<PgGucs>(),
     )| {
@@ -1425,7 +1449,7 @@ async fn generated_joinscan_semi_like(database: Db) {
         "alice", "bob", "cloe", "sally", "brandy", "brisket", "anchovy",
     ];
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         semi_join in arb_semi_joins(all_tables.clone(), join_key_columns.clone()),
         inner_term in proptest::sample::select(search_terms.clone()),
         is_anti_join in proptest::bool::ANY,
@@ -1591,7 +1615,7 @@ async fn generated_numeric_precision(database: Db) {
         "999999999999999999",
     ];
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         test_value in proptest::sample::select(precision_test_values),
         gucs in any::<PgGucs>(),
     )| {
@@ -1664,7 +1688,7 @@ async fn generated_numeric_range_precision(database: Db) {
         ("123456789012345690", "123456789012345700"),
     ];
 
-    proptest!(|(
+    proptest!(qgen_proptest_config(), |(
         (low, high) in proptest::sample::select(range_bounds),
         gucs in any::<PgGucs>(),
     )| {

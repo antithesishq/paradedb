@@ -11,6 +11,14 @@ workspace = true
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Draw proptest's randomness from the Antithesis SDK (via RngAlgorithm::Antithesis) instead of
+# ChaCha, so the platform controls and branches the entropy stream for the qgen property tests.
+# The `antithesis` feature lives in our proptest fork (antithesishq/proptest); it is enabled only
+# in the Antithesis proptests build (docker/Dockerfile.proptests) and stays off for normal
+# `cargo test`.
+dst = ["proptest/antithesis"]
+
 [dependencies]
 approx = "0.5.1"
 anyhow = "1.0.102"
@@ -47,6 +55,10 @@ tokenizers = { path = "../tokenizers" }
 tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros"] }
 uuid = "1.23.1"
 num-traits = "0.2.19"
-proptest = "1.11.0"
+# Fork adds RngAlgorithm::Antithesis behind the `dst` feature (see [features] above).
+# Pinned to a rev; the fork's crate version is 1.11.0, matching what paradedb used before.
+proptest = { git = "https://github.com/antithesishq/proptest", rev = "6061eb48d67ff76f882e709677308816d5791ce7" }
+# proptest-derive stays on crates.io: the fork's derive crate is 0.8.0 (incompatible with our 0.6),
+# and the antithesis feature is only on the proptest crate, not the derive macro.
 proptest-derive = "0.6.0"
 env_logger = "0.11.10"
