@@ -612,6 +612,211 @@ impl PgGucs {
 
 /// Run the given pg and bm25 queries on the given connection, and compare their results when run
 /// with the given GUCs.
+/// Classify a `sqlx::Error` as a transient, fault-induced failure that qgen should tolerate
+/// (rather than a genuine correctness or SQL bug). Mirrors the connection-loss predicate stressgres
+/// uses (see `stressgres-resilience-plan.md`), adapted to `sqlx`, plus `statement_timeout` (57014)
+/// and recovery-conflict codes. Only consulted under the `dst` feature; a plain `cargo test`
+/// keeps the strict "any query error is a failure" behavior.
+#[cfg(feature = "dst")]
+pub fn is_transient_db_error(e: &sqlx::Error) -> bool {
+    match e {
+        // Socket died: killed pod, connection reset, EOF/refused, or a network partition that
+        // finally TCP-timed-out. (kill/stop are excluded for paradedb in the current fault config,
+        // so in practice these mostly cover partitions and CNPG-side blips.)
+        sqlx::Error::Io(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(db) => {
+            let code = db.code().unwrap_or_default();
+            code == "57014"                 // query_canceled (statement_timeout fired)
+                || code.starts_with("08")   // connection_exception
+                || code == "57P01"          // admin_shutdown (graceful stop)
+                || code == "57P02"          // crash_shutdown
+                || code == "57P03"          // cannot_connect_now (during recovery)
+                || code == "40001"          // serialization_failure (recovery conflict)
+                || code == "40P01" // deadlock_detected
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of a single qgen comparison case.
+pub enum CaseOutcome {
+    /// PostgreSQL and BM25 produced identical results.
+    Match,
+    /// A query failed with a transient, fault-induced error (only recognized under the `dst`
+    /// feature). Tolerated: there is no correctness verdict for this case.
+    Transient,
+    /// A genuine failure -- a result mismatch, or a hard (non-transient) SQL error. Carries a
+    /// `TestCaseError` with the reproduction script already embedded.
+    Failure(TestCaseError),
+}
+
+impl CaseOutcome {
+    /// Collapse to a proptest result: a match or a tolerated transient error is `Ok`; a genuine
+    /// failure is `Err`.
+    pub fn into_test_result(self) -> Result<(), TestCaseError> {
+        match self {
+            CaseOutcome::Match | CaseOutcome::Transient => Ok(()),
+            CaseOutcome::Failure(e) => Err(e),
+        }
+    }
+}
+
+/// Run one generated case: execute `pg_query` (custom scan off, the known-correct baseline) and
+/// `bm25_query` (with `gucs`), then compare their results. Query errors are classified by
+/// [`is_transient_db_error`]: transient -> [`CaseOutcome::Transient`], otherwise
+/// [`CaseOutcome::Failure`]. A result mismatch is [`CaseOutcome::Failure`].
+pub fn compare_outcome<R, F>(
+    pg_query: &str,
+    bm25_query: &str,
+    gucs: &PgGucs,
+    conn: &mut PgConnection,
+    setup_sql: &str,
+    run_query: F,
+) -> CaseOutcome
+where
+    R: Eq + Debug,
+    F: Fn(&str, &mut PgConnection) -> Result<R, sqlx::Error>,
+{
+    // A panic inside `run_query` or the comparison (as opposed to a returned `sqlx::Error`) is
+    // caught here and turned into a genuine `Failure`, so it still trips the per-test
+    // `assert_always!` oracle and carries a reproduction script -- rather than escaping the oracle
+    // and surfacing only as the driver process aborting. Typed `sqlx::Error`s continue to take the
+    // classified, transient-aware path in `classify_query_error`.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        compare_outcome_inner(pg_query, bm25_query, gucs, conn, setup_sql, run_query)
+    }));
+    match outcome {
+        Ok(o) => o,
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                format!("Panic: {s}")
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                format!("Panic: {s}")
+            } else {
+                "Panic occurred".to_string()
+            };
+            CaseOutcome::Failure(handle_compare_error(
+                TestCaseError::fail(msg),
+                pg_query,
+                bm25_query,
+                gucs,
+                setup_sql,
+            ))
+        }
+    }
+}
+
+fn compare_outcome_inner<R, F>(
+    pg_query: &str,
+    bm25_query: &str,
+    gucs: &PgGucs,
+    conn: &mut PgConnection,
+    setup_sql: &str,
+    run_query: F,
+) -> CaseOutcome
+where
+    R: Eq + Debug,
+    F: Fn(&str, &mut PgConnection) -> Result<R, sqlx::Error>,
+{
+    // The postgres query always runs with the paradedb custom scan turned off, so we compare
+    // against Postgres' known-correct plan rather than our own pushdown.
+    if let Err(e) = PgGucs::pg_search_disabled().set().execute_result(conn) {
+        return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql);
+    }
+    if let Err(e) = conn.deallocate_all() {
+        return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql);
+    }
+    let pg_result = match run_query(pg_query, conn) {
+        Ok(r) => r,
+        Err(e) => return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql),
+    };
+
+    // The "bm25" query runs with the case's GUCs set.
+    if let Err(e) = gucs.set().execute_result(conn) {
+        return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql);
+    }
+    if let Err(e) = conn.deallocate_all() {
+        return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql);
+    }
+    let bm25_result = match run_query(bm25_query, conn) {
+        Ok(r) => r,
+        Err(e) => return classify_query_error(e, pg_query, bm25_query, gucs, setup_sql),
+    };
+
+    match assert_results_match(&pg_result, &bm25_result, pg_query, bm25_query, gucs, conn) {
+        Ok(()) => CaseOutcome::Match,
+        Err(e) => CaseOutcome::Failure(handle_compare_error(
+            e, pg_query, bm25_query, gucs, setup_sql,
+        )),
+    }
+}
+
+/// Map a query-execution `sqlx::Error` to a [`CaseOutcome`]: transient (fault-induced) errors are
+/// tolerated under the `dst` feature; everything else is a genuine failure carrying the
+/// reproduction script.
+fn classify_query_error(
+    e: sqlx::Error,
+    pg_query: &str,
+    bm25_query: &str,
+    gucs: &PgGucs,
+    setup_sql: &str,
+) -> CaseOutcome {
+    #[cfg(feature = "dst")]
+    if is_transient_db_error(&e) {
+        return CaseOutcome::Transient;
+    }
+    let tce = TestCaseError::fail(format!("{e}:  error in query execution"));
+    CaseOutcome::Failure(handle_compare_error(
+        tce, pg_query, bm25_query, gucs, setup_sql,
+    ))
+}
+
+/// Assert the two result sets are equal, attaching the BM25 plan to the failure message. The
+/// EXPLAIN is built lazily as a `prop_assert_eq!` message argument, so it runs ONLY on a mismatch --
+/// building it eagerly would run an extra EXPLAIN for every passing case (doubling planning work and
+/// needlessly tripping any EXPLAIN-time SUT error). It is best-effort so a transient fault while
+/// composing the message can't itself panic.
+fn assert_results_match<R>(
+    pg_result: &R,
+    bm25_result: &R,
+    pg_query: &str,
+    bm25_query: &str,
+    gucs: &PgGucs,
+    conn: &mut PgConnection,
+) -> Result<(), TestCaseError>
+where
+    R: Eq + Debug,
+{
+    prop_assert_eq!(
+        pg_result,
+        bm25_result,
+        "\ngucs={:?}\npg:\n  {}\nbm25:\n  {}\nexplain:\n{}\n",
+        gucs,
+        pg_query,
+        bm25_query,
+        format!("EXPLAIN {bm25_query}")
+            .fetch_result::<(String,)>(conn)
+            .map(|rows| rows
+                .into_iter()
+                .map(|(s,)| s)
+                .collect::<Vec<_>>()
+                .join("\n"))
+            .unwrap_or_else(|e| format!("<EXPLAIN unavailable: {e}>"))
+    );
+    Ok(())
+}
+
+/// Panic-based comparison used by the non-Antithesis generator tests (`json_pushdown`,
+/// `scalar_array_pushdown`): the `run_query` closure returns the result directly and panics on a
+/// DB error. This is a thin wrapper over [`compare_outcome`] -- the closure is adapted to the
+/// `Result`-returning shape and any panic is caught by `compare_outcome`'s `catch_unwind` and
+/// mapped to a `Failure` -- so both paths share one execution + comparison implementation. qgen
+/// calls [`compare_outcome`] directly so it can tolerate transient faults and emit a per-test
+/// Antithesis property.
 pub fn compare<R, F>(
     pg_query: &str,
     bm25_query: &str,
@@ -624,75 +829,15 @@ where
     R: Eq + Debug,
     F: Fn(&str, &mut PgConnection) -> R,
 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        inner_compare(pg_query, bm25_query, gucs, conn, run_query)
-    }));
-
-    let inner_result = match result {
-        Ok(r) => r,
-        Err(e) => {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                format!("Panic: {}", s)
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                format!("Panic: {}", s)
-            } else {
-                "Panic occurred".to_string()
-            };
-            Err(TestCaseError::fail(msg))
-        }
-    };
-
-    match inner_result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(handle_compare_error(
-            e, pg_query, bm25_query, gucs, setup_sql,
-        )),
-    }
-}
-
-fn inner_compare<R, F>(
-    pg_query: &str,
-    bm25_query: &str,
-    gucs: &PgGucs,
-    conn: &mut PgConnection,
-    run_query: F,
-) -> Result<(), TestCaseError>
-where
-    R: Eq + Debug,
-    F: Fn(&str, &mut PgConnection) -> R,
-{
-    // the postgres query is always run with the paradedb custom scan turned off
-    // this ensures we get the actual, known-to-be-correct result from Postgres'
-    // plan, and not from ours where we did some kind of pushdown
-    PgGucs::pg_search_disabled().set().execute(conn);
-
-    conn.deallocate_all()?;
-
-    let pg_result = run_query(pg_query, conn);
-
-    // and for the "bm25" query, we run it with the given GUCs set.
-    gucs.set().execute(conn);
-
-    conn.deallocate_all()?;
-
-    let bm25_result = run_query(bm25_query, conn);
-
-    prop_assert_eq!(
-        &pg_result,
-        &bm25_result,
-        "\ngucs={:?}\npg:\n  {}\nbm25:\n  {}\nexplain:\n{}\n",
-        gucs,
+    compare_outcome(
         pg_query,
         bm25_query,
-        format!("EXPLAIN {bm25_query}")
-            .fetch::<(String,)>(conn)
-            .into_iter()
-            .map(|(s,)| s)
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-
-    Ok(())
+        gucs,
+        conn,
+        setup_sql,
+        |query, conn| Ok::<R, sqlx::Error>(run_query(query, conn)),
+    )
+    .into_test_result()
 }
 
 /// Helper function to handle comparison errors and generate reproduction scripts

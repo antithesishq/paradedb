@@ -13,14 +13,19 @@ crate-type = ["rlib"]
 
 [features]
 # Draw proptest's randomness from the Antithesis SDK (via RngAlgorithm::Antithesis) instead of
-# ChaCha, so the platform controls and branches the entropy stream for the qgen property tests.
-# The `antithesis` feature lives in our proptest fork (antithesishq/proptest); it is enabled only
-# in the Antithesis proptests build (docker/Dockerfile.proptests) and stays off for normal
-# `cargo test`.
-dst = ["proptest/antithesis"]
+# ChaCha, so the platform controls and branches the entropy stream for the qgen property tests,
+# and dispatch the per-test correctness assertions through the `dst` crate for real (`dst/enabled`).
+# The `antithesis` feature on proptest lives in our fork (antithesishq/proptest); the whole feature
+# is enabled only in the Antithesis proptests build (docker/Dockerfile.proptests) and stays off for
+# normal `cargo test`, where the `dst` assertion macros compile to nothing.
+dst = ["proptest/antithesis", "dst/enabled"]
 
 [dependencies]
 approx = "0.5.1"
+# Shared Antithesis (DST) hooks: `dst::init()` and the `dst::assert_*!` macros used by the qgen
+# oracles. Off by default — the macros expand to type-checked dead code until `dst/enabled` is
+# turned on via the `dst` feature above (same crate pg_search/stressgres route through).
+dst = { path = "../dst" }
 anyhow = "1.0.102"
 async-std = { version = "1.13.2", features = ["attributes"] }
 bigdecimal = { version = "0.4.10", features = ["serde"] }

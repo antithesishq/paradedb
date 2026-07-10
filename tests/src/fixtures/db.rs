@@ -169,6 +169,15 @@ where
         })
     }
 
+    /// Like [`fetch_dynamic`], but surfaces the `sqlx::Error` instead of panicking, so callers
+    /// (qgen) can classify transient fault-induced errors vs genuine failures.
+    fn fetch_dynamic_result(
+        self,
+        connection: &mut PgConnection,
+    ) -> Result<Vec<PgRow>, sqlx::Error> {
+        block_on(async { sqlx::query(self.as_ref()).fetch_all(connection).await })
+    }
+
     fn fetch_scalar<T>(self, connection: &mut PgConnection) -> Vec<T>
     where
         T: Type<Postgres> + for<'a> Decode<'a, sqlx::Postgres> + Send + Unpin,
@@ -190,6 +199,18 @@ where
                 .fetch_one(connection)
                 .await
                 .unwrap_or_else(|e| panic!("{e}:  error in query '{}'", self.as_ref()))
+        })
+    }
+
+    /// Like [`fetch_one`], but surfaces the `sqlx::Error` instead of panicking.
+    fn fetch_one_result<T>(self, connection: &mut PgConnection) -> Result<T, sqlx::Error>
+    where
+        T: for<'r> FromRow<'r, <Postgres as sqlx::Database>::Row> + Send + Unpin,
+    {
+        block_on(async {
+            sqlx::query_as::<_, T>(self.as_ref())
+                .fetch_one(connection)
+                .await
         })
     }
 

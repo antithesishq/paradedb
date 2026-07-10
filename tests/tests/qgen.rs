@@ -23,7 +23,7 @@ use tests::fixtures::querygen::pagegen::arb_paging_exprs;
 use tests::fixtures::querygen::wheregen::arb_wheres;
 use tests::fixtures::querygen::wheregen::Expr as WhereExpr;
 use tests::fixtures::querygen::{
-    arb_joins_and_wheres, compare, generated_queries_setup, Column, PgGucs,
+    arb_joins_and_wheres, compare_outcome, generated_queries_setup, Column, PgGucs,
 };
 
 use tests::fixtures::*;
@@ -57,6 +57,47 @@ fn qgen_proptest_config() -> proptest::test_runner::Config {
         config.max_shrink_iters = 0;
     }
     config
+}
+
+/// Register the Antithesis assertion catalog exactly once. Idempotent and cheap after the first
+/// call; guarded so it can be invoked from every case. Registering the catalog means each per-test
+/// `Always` property is known to the platform even before it is first hit, so a generator that
+/// never runs surfaces as an unreached (failing) property rather than silently missing. Routed
+/// through [`dst::init`], which is a no-op unless `dst/enabled` (the `dst` feature) is on.
+fn ensure_dst_init() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(dst::init);
+}
+
+/// Report the outcome of one qgen comparison case as a per-test Antithesis property, then collapse
+/// it to a proptest result. `$prop` is the (literal) property name; `$outcome` is a [`CaseOutcome`]
+/// from `compare_outcome`. The single `Always` assertion doubles as a reachability check
+/// (`Always` implies `Reachable`): it fails on a genuine mismatch or hard SQL error, is skipped for
+/// a tolerated transient fault, and — because it is cataloged — fails as unreached if the generator
+/// never produces a clean case. The assertions go through the `dst` crate, whose macros compile to
+/// type-checked dead code unless `dst/enabled` (the `dst` feature) is on, so under a plain
+/// `cargo test` this is just the pass/fail mapping, identical to the old behavior.
+macro_rules! qgen_oracle {
+    ($prop:literal, $outcome:expr) => {{
+        let outcome = $outcome;
+        ensure_dst_init();
+        match &outcome {
+            tests::fixtures::querygen::CaseOutcome::Match => {
+                dst::assert_always!(true, $prop, &serde_json::json!({}));
+            }
+            tests::fixtures::querygen::CaseOutcome::Failure(e) => {
+                dst::assert_always!(
+                    false,
+                    $prop,
+                    &serde_json::json!({ "detail": e.to_string() })
+                );
+            }
+            // Transient (fault-induced) errors get no correctness verdict for this case.
+            tests::fixtures::querygen::CaseOutcome::Transient => {}
+        }
+        outcome.into_test_result()
+    }};
 }
 
 const COLUMNS: &[Column] = &[
@@ -252,14 +293,14 @@ async fn generated_joins_small(database: Db) {
 
         let from = format!("SELECT COUNT(*) {join_clause} ");
 
-        compare(
+        qgen_oracle!("qgen: generated_joins_small - BM25 result matches PostgreSQL", compare_outcome(
             &format!("{from} WHERE {}", where_expr.to_sql(" = ")),
             &format!("{from} WHERE {}", where_expr.to_sql("@@@")),
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch_one::<(i64,)>(conn).0,
-        )?;
+            |query, conn| Ok(query.fetch_one_result::<(i64,)>(conn)?.0),
+        ))?;
     });
 }
 
@@ -313,14 +354,17 @@ async fn generated_joins_large_limit(database: Db) {
 
         let from = format!("SELECT {target_list} {join_clause} ");
 
-        compare(
+        // This test is #[ignore]d, so it never runs. Emit no Antithesis property for it: a cataloged
+        // `Always` that is never reached would otherwise show as a permanently-failing property.
+        compare_outcome(
             &format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql(" = ")),
             &format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql("@@@")),
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch_dynamic(conn).len(),
-        )?;
+            |query, conn| Ok(query.fetch_dynamic_result(conn)?.len()),
+        )
+        .into_test_result()?;
     });
 }
 
@@ -349,18 +393,18 @@ async fn generated_single_relation(database: Db) {
         gucs in any::<PgGucs>(),
         target in prop_oneof![Just("COUNT(*)"), Just("id")],
     )| {
-        compare(
+        qgen_oracle!("qgen: generated_single_relation - BM25 result matches PostgreSQL", compare_outcome(
             &format!("SELECT {target} FROM {table_name} WHERE {}", where_expr.to_sql(" = ")),
             &format!("SELECT {target} FROM {table_name} WHERE {}", where_expr.to_sql("@@@")),
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                let mut rows = query.fetch::<(i64,)>(conn);
+                let mut rows = query.fetch_result::<(i64,)>(conn)?;
                 rows.sort();
-                rows
+                Ok(rows)
             }
-        )?;
+        ))?;
     });
 }
 
@@ -454,9 +498,10 @@ async fn generated_group_by_aggregates(database: Db) {
         );
 
         // Custom result comparator for GROUP BY results
-        let compare_results = |query: &str, conn: &mut PgConnection| -> Vec<String> {
+        let compare_results =
+            |query: &str, conn: &mut PgConnection| -> Result<Vec<String>, sqlx::Error> {
             // Fetch all rows as dynamic results and convert to string representation
-            let rows = query.fetch_dynamic(conn);
+            let rows = query.fetch_dynamic_result(conn)?;
             let string_rows: Vec<String> = rows
                 .into_iter()
                 .map(|row| {
@@ -484,10 +529,10 @@ async fn generated_group_by_aggregates(database: Db) {
                 })
                 .collect();
 
-            string_rows
+            Ok(string_rows)
         };
 
-        compare(&pg_query, &bm25_query, &gucs, &mut pool.pull(), &setup_sql, compare_results)?;
+        qgen_oracle!("qgen: generated_group_by_aggregates - BM25 result matches PostgreSQL", compare_outcome(&pg_query, &bm25_query, &gucs, &mut pool.pull(), &setup_sql, compare_results))?;
     });
 }
 
@@ -513,14 +558,14 @@ async fn generated_paging_small(database: Db) {
         paging_exprs in arb_paging_exprs(table_name, vec!["name", "color", "age", "quantity"], vec!["id", "uuid"]),
         gucs in any::<PgGucs>(),
     )| {
-        compare(
+        qgen_oracle!("qgen: generated_paging_small - BM25 result matches PostgreSQL", compare_outcome(
             &format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql(" = ")),
             &format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql("@@@")),
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch::<(i64,)>(conn),
-        )?;
+            |query, conn| query.fetch_result::<(i64,)>(conn),
+        ))?;
     });
 }
 
@@ -550,14 +595,14 @@ async fn generated_paging_large(database: Db) {
         paging_exprs in arb_paging_exprs(table_name, vec![], vec!["uuid"]),
         gucs in any::<PgGucs>(),
     )| {
-        compare(
+        qgen_oracle!("qgen: generated_paging_large - BM25 result matches PostgreSQL", compare_outcome(
             &format!("SELECT uuid::text FROM {table_name} WHERE name  =  'bob' {paging_exprs}"),
             &format!("SELECT uuid::text FROM {table_name} WHERE name @@@ 'bob' {paging_exprs}"),
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch::<(String,)>(conn),
-        )?;
+            |query, conn| query.fetch_result::<(String,)>(conn),
+        ))?;
     });
 }
 
@@ -622,14 +667,14 @@ async fn generated_subquery(database: Db) {
             outer_where_expr.to_sql("@@@"),
         );
 
-        compare(
+        qgen_oracle!("qgen: generated_subquery - BM25 result matches PostgreSQL", compare_outcome(
             &pg,
             &bm25,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch_one::<(i64,)>(conn),
-        )?;
+            |query, conn| query.fetch_one_result::<(i64,)>(conn),
+        ))?;
     });
 }
 
@@ -799,29 +844,45 @@ async fn generated_joinscan(database: Db) {
             "{from} WHERE {bm25_where} ORDER BY {order_by} LIMIT {limit}"
         );
 
-        // Verify JoinScan was actually used
+        // Verify JoinScan was actually used. A transient fault while fetching the plan is tolerated
+        // (skip the plan-shape check for this case); any other error — a genuine planning failure
+        // like a pg_search panic, and every error under a plain `cargo test` — fails the case so it
+        // is surfaced rather than silently swallowed.
         {
             let conn = &mut pool.pull();
-            gucs.set().execute(conn);
-            let explain_query = format!("EXPLAIN (FORMAT JSON) {bm25_query}");
-            let (plan,): (Value,) = explain_query.fetch_one(conn);
-            let plan_str = format!("{plan:#?}");
-            prop_assert!(
-                plan_str.contains("ParadeDB Join Scan"),
-                "Query should use ParadeDB Join Scan but got plan: {plan_str}\nQuery: {bm25_query}",
-            );
+            let plan_result = gucs.set().execute_result(conn).and_then(|()| {
+                format!("EXPLAIN (FORMAT JSON) {bm25_query}").fetch_one_result::<(Value,)>(conn)
+            });
+            match plan_result {
+                Ok((plan,)) => {
+                    let plan_str = format!("{plan:#?}");
+                    prop_assert!(
+                        plan_str.contains("ParadeDB Join Scan"),
+                        "Query should use ParadeDB Join Scan but got plan: {plan_str}\nQuery: {bm25_query}",
+                    );
+                }
+                #[cfg(feature = "dst")]
+                Err(e) if tests::fixtures::querygen::is_transient_db_error(&e) => {
+                    // Tolerated fault-induced error; skip the plan-shape check for this case.
+                }
+                Err(e) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "{e}:  EXPLAIN failed for '{bm25_query}'"
+                    )));
+                }
+            }
         }
 
-        compare(
+        qgen_oracle!("qgen: generated_joinscan - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                "SET work_mem TO '16MB';".execute(conn);
+                "SET work_mem TO '16MB';".execute_result(conn)?;
                 // Use dynamic fetch since column count varies with HeapCondition
-                let rows = query.fetch_dynamic(conn);
+                let rows = query.fetch_dynamic_result(conn)?;
                 // Convert to sorted string representation for comparison
                 let mut row_strings: Vec<String> = rows
                     .into_iter()
@@ -833,9 +894,9 @@ async fn generated_joinscan(database: Db) {
                     })
                     .collect();
                 row_strings.sort();
-                row_strings
+                Ok(row_strings)
             },
-        )?;
+        ))?;
     });
 }
 
@@ -946,14 +1007,14 @@ async fn generated_aggregate_join(database: Db) {
         gucs.join_custom_scan = true;
         gucs.custom_scan = true;
 
-        compare(
+        qgen_oracle!("qgen: generated_aggregate_join - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                let rows = query.fetch_dynamic(conn);
+                let rows = query.fetch_dynamic_result(conn)?;
                 let mut string_rows: Vec<String> = rows
                     .into_iter()
                     .map(|row| {
@@ -979,9 +1040,9 @@ async fn generated_aggregate_join(database: Db) {
                     })
                     .collect();
                 string_rows.sort();
-                string_rows
+                Ok(string_rows)
             },
-        )?;
+        ))?;
     });
 }
 
@@ -1054,14 +1115,14 @@ async fn generated_aggregate_join_distinct(database: Db) {
         gucs.join_custom_scan = true;
         gucs.custom_scan = true;
 
-        compare(
+        qgen_oracle!("qgen: generated_aggregate_join_distinct - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                let rows = query.fetch_dynamic(conn);
+                let rows = query.fetch_dynamic_result(conn)?;
                 let mut string_rows: Vec<String> = rows
                     .into_iter()
                     .map(|row| {
@@ -1087,9 +1148,9 @@ async fn generated_aggregate_join_distinct(database: Db) {
                     })
                     .collect();
                 string_rows.sort();
-                string_rows
+                Ok(string_rows)
             },
-        )?;
+        ))?;
     });
 }
 
@@ -1165,8 +1226,9 @@ async fn generated_group_by_stddev(database: Db) {
         );
 
         // Custom result comparator that rounds f64 values to 6 decimal places
-        let compare_results = |query: &str, conn: &mut PgConnection| -> Vec<String> {
-            let rows = query.fetch_dynamic(conn);
+        let compare_results =
+            |query: &str, conn: &mut PgConnection| -> Result<Vec<String>, sqlx::Error> {
+            let rows = query.fetch_dynamic_result(conn)?;
             let mut string_rows: Vec<String> = rows
                 .into_iter()
                 .map(|row| {
@@ -1197,10 +1259,10 @@ async fn generated_group_by_stddev(database: Db) {
 
             // Sort for consistent comparison
             string_rows.sort();
-            string_rows
+            Ok(string_rows)
         };
 
-        compare(&pg_query, &bm25_query, &gucs, &mut pool.pull(), &setup_sql, compare_results)?;
+        qgen_oracle!("qgen: generated_group_by_stddev - BM25 result matches PostgreSQL", compare_outcome(&pg_query, &bm25_query, &gucs, &mut pool.pull(), &setup_sql, compare_results))?;
     });
 }
 
@@ -1292,14 +1354,14 @@ async fn generated_join_aggregates(database: Db) {
         gucs.join_custom_scan = true;
         gucs.custom_scan = true;
 
-        compare(
+        qgen_oracle!("qgen: generated_join_aggregates - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                let rows = query.fetch_dynamic(conn);
+                let rows = query.fetch_dynamic_result(conn)?;
                 let mut string_rows: Vec<String> = rows
                     .into_iter()
                     .map(|row| {
@@ -1325,9 +1387,9 @@ async fn generated_join_aggregates(database: Db) {
                     })
                     .collect();
                 string_rows.sort();
-                string_rows
+                Ok(string_rows)
             },
-        )?;
+        ))?;
     });
 }
 
@@ -1389,18 +1451,18 @@ async fn generated_numeric_pushdown(database: Db) {
             "SELECT id FROM {table_name} WHERE {bm25_predicate} AND {where_clause} ORDER BY id"
         );
 
-        compare(
+        qgen_oracle!("qgen: generated_numeric_pushdown - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
             |query, conn| {
-                let mut rows = query.fetch::<(i64,)>(conn);
+                let mut rows = query.fetch_result::<(i64,)>(conn)?;
                 rows.sort();
-                rows
+                Ok(rows)
             },
-        )?;
+        ))?;
     });
 }
 
@@ -1546,14 +1608,14 @@ async fn generated_joinscan_semi_like(database: Db) {
         for join_custom_scan in [false, true] {
             gucs.join_custom_scan = join_custom_scan;
 
-            compare(
+            qgen_oracle!("qgen: generated_joinscan_semi_like - BM25 result matches PostgreSQL", compare_outcome(
                 &pg_query,
                 &bm25_query,
                 &gucs,
                 &mut pool.pull(),
                 &setup_sql,
-                |query, conn| query.fetch::<(i64, String)>(conn),
-            )?;
+                |query, conn| query.fetch_result::<(i64, String)>(conn),
+            ))?;
         }
     });
 }
@@ -1630,14 +1692,14 @@ async fn generated_numeric_precision(database: Db) {
             "SELECT COUNT(*) FROM {table_name} WHERE name @@@ 'test' AND big_int = {test_value}"
         );
 
-        compare(
+        qgen_oracle!("qgen: generated_numeric_precision - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch_one::<(i64,)>(conn).0,
-        )?;
+            |query, conn| Ok(query.fetch_one_result::<(i64,)>(conn)?.0),
+        ))?;
     });
 }
 
@@ -1703,13 +1765,13 @@ async fn generated_numeric_range_precision(database: Db) {
             "SELECT COUNT(*) FROM {table_name} WHERE name @@@ 'test' AND big_int >= {low} AND big_int < {high}"
         );
 
-        compare(
+        qgen_oracle!("qgen: generated_numeric_range_precision - BM25 result matches PostgreSQL", compare_outcome(
             &pg_query,
             &bm25_query,
             &gucs,
             &mut pool.pull(),
             &setup_sql,
-            |query, conn| query.fetch_one::<(i64,)>(conn).0,
-        )?;
+            |query, conn| Ok(query.fetch_one_result::<(i64,)>(conn)?.0),
+        ))?;
     });
 }
