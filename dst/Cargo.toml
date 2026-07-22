@@ -12,14 +12,17 @@ workspace = true
 # Off by default: with `enabled` unset the whole crate compiles to nothing — the assertion
 # macros expand to a dead `if false { … }` that still type-checks their arguments,
 # `GhostState<T>` is a zero-sized type, and `init()` is a no-op, so a build that does not opt
-# in never links the Antithesis SDK. Turning `enabled` on pulls in the SDK and dispatches for
-# real.
-enabled = ["dep:antithesis_sdk"]
+# in never links the Antithesis SDK. Turning `enabled` on pulls in the SDK (for assertions) and
+# the coverage-instrumentation runtime shim, and dispatches for real. See the crate docs.
+enabled = ["dep:antithesis_sdk", "dep:antithesis-instrumentation"]
 
 [dependencies]
 antithesis_sdk = { version = "0.2.9", default-features = false, features = [
   "full",
 ], optional = true }
+# Coverage-instrumentation runtime shim (sancov symbols + loads libvoidstar at runtime); referenced
+# in lib.rs so the linker keeps it. Sancov build flags live in the consumer's build recipe.
+antithesis-instrumentation = { version = "0.1", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

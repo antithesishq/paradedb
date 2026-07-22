@@ -27,10 +27,6 @@ panic = "unwind"
 opt-level = 3
 codegen-units = 1
 
-[profile.release-with-debug]
-inherits = "release"
-debug = true
-
 [workspace.dependencies]
 tantivy = { git = "https://github.com/paradedb/tantivy.git", package = "tantivy", rev = "3c423758142d018d92f7e38d93fc5d23b94287d1", features = [
   "columnar-zstd-compression",

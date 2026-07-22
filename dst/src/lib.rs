@@ -44,6 +44,11 @@
 #[doc(hidden)]
 pub use antithesis_sdk;
 
+// Link the coverage-instrumentation shim for `enabled` consumers; `as _` keeps the linker from
+// dropping it (it provides the sancov symbols and loads libvoidstar at runtime).
+#[cfg(feature = "enabled")]
+use antithesis_instrumentation as _;
+
 /// Register the Antithesis assertion catalog for this process. Required once per process that
 /// emits assertions; without it a never-hit `assert_unreachable!` would pass vacuously instead
 /// of being reported. `antithesis_init` is idempotent, so it is safe to call from every process

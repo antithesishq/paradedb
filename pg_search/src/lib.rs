@@ -16,6 +16,12 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 #![recursion_limit = "512"]
 
+// Keep the coverage-instrumentation shim in this cdylib: `as _` stops the linker dropping its
+// `.init_array` constructor, and a transitive reference through `dst` is not enough for a cdylib,
+// so pg_search depends on the crate directly. Instrumented build only (`--features dst`).
+#[cfg(feature = "dst")]
+use antithesis_instrumentation as _;
+
 mod aggregate;
 mod api;
 mod bootstrap;

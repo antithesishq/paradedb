@@ -24,6 +24,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     libjpeg-dev \
     libfontconfig1-dev \
     ca-certificates \
+    curl \
     postgresql-client \
     libpq5 \
     util-linux \
@@ -31,6 +32,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 # Create app user
 RUN useradd --create-home --shell /bin/bash app
+
+# Antithesis symbolization: the driver's debug info must be under /symbols for coverage to map to
+# source. The dev build is unstripped, so a symlink suffices (matched by build-id); the build step
+# below adds it, so make /symbols app-owned.
+RUN mkdir -p /symbols && chown app:app /symbols
 
 # Set working directory
 WORKDIR /home/app
@@ -48,9 +54,15 @@ USER app
 ENV RUST_LOG=info
 ENV PGCLIENTENCODING=UTF8
 
-# Prefetch deps and build Stressgres while we have Internet. This Docker image
-# will be run in an air-gapped environment in Antithesis
+# Prefetch deps and build Stressgres while we have Internet — the image runs air-gapped in
+# Antithesis. Debug (`dev`) profile for debug assertions. The coverage shim comes from the `dst`
+# dep (no -lvoidstar; Antithesis injects libvoidstar at runtime), though antithesis-instrumentation's
+# build script still needs curl + a C toolchain here. Sancov flags are scoped to an explicit
+# --target so they don't reach host build scripts/proc-macros. See docs/reference/sdk/rust/instrumentation.
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id"
 RUN cargo fetch --manifest-path /home/app/Cargo.toml && \
-    cargo build --offline --release --manifest-path /home/app/Cargo.toml -p stressgres
+    cargo build --offline --target x86_64-unknown-linux-gnu \
+        --manifest-path /home/app/Cargo.toml -p stressgres && \
+    ln -sf /home/app/target/x86_64-unknown-linux-gnu/debug/stressgres /symbols/stressgres
 
 CMD ["sleep", "infinity"]
